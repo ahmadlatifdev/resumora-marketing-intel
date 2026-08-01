@@ -1,0 +1,19 @@
+# Copy to prod.tfvars and fill values. Do NOT commit SA JSON keys.
+project_id          = "key-journal-378204"
+billing_account_id  = "XXXXXX-XXXXXX-XXXXXX"
+region              = "us-central1"
+environment         = "prod"
+budget_amount_usd   = 50
+enable_budget_alert = false
+
+bigquery_dataset_name          = "marketing_intelligence"
+bigquery_table_expiration_days = 90
+
+cloud_run_service_name  = "marketing-dashboard"
+cloud_run_image          = ""
+enable_public_dashboard  = true
+enable_scheduler         = true
+scheduler_timezone       = "America/Toronto"
+
+# Prefer an existing SA the deployer can act as (avoids Project IAM Admin)
+runtime_service_account_email = "github-deployer@YOUR_PROJECT_ID.iam.gserviceaccount.com"

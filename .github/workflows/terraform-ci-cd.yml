@@ -1,0 +1,155 @@
+# Standalone repo CI/CD — SA key auth only. Paths are repo-root relative.
+name: Terraform CI/CD
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: marketing-intel-deploy
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ad isolation scan
+        run: |
+          if grep -RInE 'graph\.facebook|facebook\.com/.*/ads|ads\.twitter|tiktok\.com/api|googleads\.googleapis' \
+            --include='*.py' --include='*.tf' --include='*.yml' . ; then
+            echo "::error::Forbidden Ads API references"
+            exit 1
+          fi
+          echo "Ad isolation: PASS"
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+      - name: Terraform validate
+        run: |
+          terraform -chdir=terraform init -backend=false -input=false
+          terraform -chdir=terraform validate
+
+  plan:
+    if: github.event_name == 'pull_request'
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+      - name: Terraform Plan
+        env:
+          TF_VAR_project_id: ${{ secrets.GCP_PROJECT_ID }}
+          TF_VAR_billing_account_id: ${{ secrets.GCP_BILLING_ACCOUNT }}
+          TF_VAR_enable_budget_alert: "false"
+        run: |
+          terraform -chdir=terraform init -input=false \
+            -backend-config="bucket=resumora-terraform-state-${{ secrets.GCP_PROJECT_ID }}" \
+            -backend-config="prefix=marketing-intelligence"
+          terraform -chdir=terraform plan -input=false -no-color -var-file=prod.tfvars | tee plan.txt
+
+  apply:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+      - name: Ensure APIs + state bucket
+        run: |
+          set -euo pipefail
+          gcloud services enable \
+            cloudresourcemanager.googleapis.com \
+            iam.googleapis.com \
+            serviceusage.googleapis.com \
+            bigquery.googleapis.com \
+            aiplatform.googleapis.com \
+            run.googleapis.com \
+            cloudscheduler.googleapis.com \
+            storage.googleapis.com \
+            cloudbuild.googleapis.com \
+            artifactregistry.googleapis.com \
+            containerregistry.googleapis.com \
+            --project="${{ secrets.GCP_PROJECT_ID }}"
+          sleep 20
+          gsutil ls "gs://resumora-terraform-state-${{ secrets.GCP_PROJECT_ID }}" 2>/dev/null || \
+            gcloud storage buckets create "gs://resumora-terraform-state-${{ secrets.GCP_PROJECT_ID }}" \
+              --project="${{ secrets.GCP_PROJECT_ID }}" --location=us-central1
+      - name: Build and push image
+        id: build
+        run: |
+          IMAGE="gcr.io/${{ secrets.GCP_PROJECT_ID }}/resumora-mkt-intel:${{ github.sha }}"
+          cat > /tmp/cloudbuild.yaml <<EOF
+          steps:
+          - name: gcr.io/cloud-builders/docker
+            args: ['build', '-f', 'dashboard/Dockerfile', '-t', '${IMAGE}', '.']
+          images: ['${IMAGE}']
+          EOF
+          gcloud builds submit --config=/tmp/cloudbuild.yaml . --timeout=1200s
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+      - name: Terraform Apply
+        id: tf
+        env:
+          TF_VAR_project_id: ${{ secrets.GCP_PROJECT_ID }}
+          TF_VAR_billing_account_id: ${{ secrets.GCP_BILLING_ACCOUNT }}
+          TF_VAR_enable_budget_alert: "false"
+          IMAGE: ${{ steps.build.outputs.image }}
+        run: |
+          set -euo pipefail
+          terraform -chdir=terraform init -input=false \
+            -backend-config="bucket=resumora-terraform-state-${{ secrets.GCP_PROJECT_ID }}" \
+            -backend-config="prefix=marketing-intelligence"
+          terraform -chdir=terraform apply -input=false -auto-approve \
+            -var-file=prod.tfvars \
+            -var="cloud_run_image=${IMAGE}" \
+            -var="enable_scheduler=false"
+          URL=$(terraform -chdir=terraform output -raw cloud_run_url 2>/dev/null || echo "")
+          echo "Phase1 cloud_run_url=$URL"
+          if [[ -n "$URL" && "$URL" == https://* ]]; then
+            terraform -chdir=terraform apply -input=false -auto-approve \
+              -var-file=prod.tfvars \
+              -var="cloud_run_image=${IMAGE}" \
+              -var="enable_scheduler=true"
+          fi
+          URL=$(terraform -chdir=terraform output -raw cloud_run_url 2>/dev/null || echo "")
+          echo "cloud_run_url=$URL" >> "$GITHUB_OUTPUT"
+          echo "cloud_run_url = $URL" >> "$GITHUB_STEP_SUMMARY"
+      - name: Notify Slack on Success
+        if: success()
+        continue-on-error: true
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {"text":"✅ Marketing Intelligence Deployed\nURL: ${{ steps.tf.outputs.cloud_run_url }}\nBy: ${{ github.actor }}"}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      - name: Notify Slack on Failure
+        if: failure()
+        continue-on-error: true
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {"text":"❌ Marketing Intelligence Deploy Failed\n${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
